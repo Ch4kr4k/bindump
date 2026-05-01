@@ -1,11 +1,13 @@
-﻿using System.Security.Cryptography;
+using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Text;
 
-const string Marker    = "BINARY_DUMP_V1";
-const string HashLabel = "SHA256:";
-const string SizeLabel = "SIZE:";
-const string ExtLabel  = "EXT:";
-const int    BytesPerLine = 16;
+const string Marker      = "BINARY_DUMP_V2";
+const string HashLabel   = "SHA256:";
+const string SizeLabel   = "SIZE:";
+const string ExtLabel    = "EXT:";
+const string CompLabel   = "COMPRESSED:";
+const int    LineWidth   = 76;
 
 static string Hash(byte[] data)
 {
@@ -13,28 +15,53 @@ static string Hash(byte[] data)
     return Convert.ToHexString(sha.ComputeHash(data));
 }
 
+static byte[] Compress(byte[] data)
+{
+    using var ms = new MemoryStream();
+    using (var gz = new GZipStream(ms, CompressionLevel.SmallestSize))
+        gz.Write(data);
+    return ms.ToArray();
+}
+
+static byte[] Decompress(byte[] data)
+{
+    using var input  = new MemoryStream(data);
+    using var output = new MemoryStream();
+    using (var gz = new GZipStream(input, CompressionMode.Decompress))
+        gz.CopyTo(output);
+    return output.ToArray();
+}
+
 static void Deconstruct(string src, string dst)
 {
-    byte[] data = File.ReadAllBytes(src);
-    string hash = Hash(data);
-    string ext  = Path.GetExtension(src);
+    byte[] original   = File.ReadAllBytes(src);
+    string hash       = Hash(original);
+    string ext        = Path.GetExtension(src);
+    byte[] compressed = Compress(original);
 
-    Console.WriteLine($"Read   : {src} ({data.Length} bytes)");
-    Console.WriteLine($"SHA256 : {hash}");
+    bool didCompress  = compressed.Length < original.Length;
+    byte[] payload    = didCompress ? compressed : original;
+    string b64        = Convert.ToBase64String(payload);
+
+    Console.WriteLine($"Read       : {src} ({original.Length} bytes)");
+    Console.WriteLine($"SHA256     : {hash}");
+    Console.WriteLine($"Compressed : {compressed.Length} bytes " +
+                      $"({100.0 * compressed.Length / original.Length:F1}%)");
+    if (!didCompress)
+        Console.WriteLine("Note       : compression made it larger, storing raw");
+    Console.WriteLine($"Base64     : {b64.Length} chars");
 
     using var w = new StreamWriter(dst, append: false, Encoding.ASCII);
     w.WriteLine(Marker);
     w.WriteLine($"{HashLabel}{hash}");
-    w.WriteLine($"{SizeLabel}{data.Length}");
+    w.WriteLine($"{SizeLabel}{original.Length}");
     w.WriteLine($"{ExtLabel}{ext}");
+    w.WriteLine($"{CompLabel}{didCompress}");
 
-    for (int i = 0; i < data.Length; i += BytesPerLine)
-    {
-        int len = Math.Min(BytesPerLine, data.Length - i);
-        w.WriteLine(Convert.ToHexString(data.AsSpan(i, len)));
-    }
+    for (int i = 0; i < b64.Length; i += LineWidth)
+        w.WriteLine(b64.AsSpan(i, Math.Min(LineWidth, b64.Length - i)));
 
-    Console.WriteLine($"Written: {dst}");
+    Console.WriteLine($"Written    : {dst}");
 }
 
 static void Reconstruct(string src, string dst)
@@ -56,16 +83,21 @@ static void Reconstruct(string src, string dst)
     string extLine = r.ReadLine() ?? throw new InvalidDataException("Missing ext line");
     string originalExt = extLine.StartsWith(ExtLabel) ? extLine[ExtLabel.Length..] : "";
 
+    string compLine = r.ReadLine() ?? throw new InvalidDataException("Missing compressed line");
+    if (!compLine.StartsWith(CompLabel)) throw new InvalidDataException("Malformed compressed line");
+    bool wasCompressed = bool.Parse(compLine[CompLabel.Length..]);
+
     if (!string.IsNullOrEmpty(originalExt) && Path.GetExtension(dst) != originalExt)
         Console.WriteLine($"Warning: original extension was '{originalExt}', output is '{Path.GetExtension(dst)}'");
 
-    using var ms = new MemoryStream(expectedSize);
+    var sb = new StringBuilder();
     string? line;
     while ((line = r.ReadLine()) != null)
         if (!string.IsNullOrWhiteSpace(line))
-            ms.Write(Convert.FromHexString(line));
+            sb.Append(line);
 
-    byte[] data = ms.ToArray();
+    byte[] payload = Convert.FromBase64String(sb.ToString());
+    byte[] data    = wasCompressed ? Decompress(payload) : payload;
 
     if (data.Length != expectedSize)
         throw new InvalidDataException($"Size mismatch: expected {expectedSize}, got {data.Length}");
@@ -85,7 +117,7 @@ static void Reconstruct(string src, string dst)
 static void PrintUsage()
 {
     Console.Error.WriteLine("Usage:");
-    Console.Error.WriteLine("  bindump -d <input>    <output.txt>");
+    Console.Error.WriteLine("  bindump -d <input>     <output.txt>");
     Console.Error.WriteLine("  bindump -r <input.txt> <output>");
 }
 
